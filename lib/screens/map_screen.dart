@@ -1,16 +1,36 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart' hide Animation;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:yandex_maps_mapkit/directions.dart';
 import 'package:yandex_maps_mapkit/mapkit.dart' hide Icon, TextStyle;
 import 'package:yandex_maps_mapkit/mapkit_factory.dart';
+import 'package:yandex_maps_mapkit/search.dart';
 import 'package:yandex_maps_mapkit/transport.dart';
 import 'package:yandex_maps_mapkit/yandex_map.dart';
 
 /// Способ передвижения.
-enum TravelMode { car, transit }
+enum TravelMode { car, transit, walk }
 
-/// Какую точку сейчас выбираем нажатием на карту.
+/// Какое поле сейчас заполняем (и что выбирается нажатием на карту).
 enum PickTarget { from, to }
+
+/// Найденное место: название, описание, координаты.
+class _Place {
+  _Place(this.name, this.description, this.point);
+  final String name;
+  final String? description;
+  final Point point;
+}
+
+/// Один шаг маршрута в списке внизу.
+class _Step {
+  _Step(this.icon, this.color, this.title, [this.subtitle]);
+  final IconData icon;
+  final Color color;
+  final String title;
+  final String? subtitle;
+}
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -24,36 +44,55 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   UserLocationLayer? _userLocationLayer;
   TrafficLayer? _trafficLayer;
 
-  // Маршрутизаторы создаются один раз.
   late final DrivingRouter _drivingRouter =
       DirectionsFactory.instance.createDrivingRouter(DrivingRouterType.Combined);
   late final MasstransitRouter _masstransitRouter =
       TransportFactory.instance.createMasstransitRouter();
+  late final PedestrianRouter _pedestrianRouter =
+      TransportFactory.instance.createPedestrianRouter();
+  late final SearchManager _searchManager =
+      SearchFactory.instance.createSearchManager(SearchManagerType.Combined);
 
-  // ВАЖНО: сессию надо хранить в поле, иначе запрос маршрута отменится.
+  // Сессии надо хранить в полях, иначе запрос отменится.
   DrivingSession? _drivingSession;
   MasstransitSession? _transitSession;
+  SearchSession? _searchSession;
+  SearchSession? _reverseSession;
 
   late final _TapListener _tapListener = _TapListener(_onMapTap);
+  Timer? _fixTimer;
+
+  final _fromCtl = TextEditingController();
+  final _toCtl = TextEditingController();
+  final _fromFocus = FocusNode();
+  final _toFocus = FocusNode();
 
   TravelMode _mode = TravelMode.car;
   PickTarget _pick = PickTarget.from;
   bool _trafficOn = true;
   bool _loading = false;
+  bool _searching = false;
 
   Point? _from;
   Point? _to;
   bool _fromIsMyLocation = false;
 
-  String? _info;
+  List<_Place> _results = [];
+  String? _summary;
+  List<_Step> _steps = [];
 
-  // Начальная точка камеры (Москва), пока нет GPS.
   static const _startPoint = Point(latitude: 55.751244, longitude: 37.618423);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _fromFocus.addListener(() {
+      if (_fromFocus.hasFocus) setState(() => _pick = PickTarget.from);
+    });
+    _toFocus.addListener(() {
+      if (_toFocus.hasFocus) setState(() => _pick = PickTarget.to);
+    });
     mapkit.onStart();
     _requestLocationPermission();
   }
@@ -61,8 +100,15 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _fixTimer?.cancel();
     _drivingSession?.cancel();
     _transitSession?.cancel();
+    _searchSession?.cancel();
+    _reverseSession?.cancel();
+    _fromCtl.dispose();
+    _toCtl.dispose();
+    _fromFocus.dispose();
+    _toFocus.dispose();
     mapkit.onStop();
     super.dispose();
   }
@@ -93,10 +139,31 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final layer = mapkit.createUserLocationLayer(window);
     layer.setVisible(true);
     _userLocationLayer = layer;
+
+    // Как только GPS определит позицию, один раз переносим туда камеру.
+    var ticks = 0;
+    _fixTimer?.cancel();
+    _fixTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      ticks++;
+      final pos = _currentPosition();
+      if (pos != null) {
+        t.cancel();
+        _moveTo(pos, zoom: 14);
+        _trafficLayer?.setTrafficVisible(_trafficOn);
+      } else if (ticks > 60) {
+        t.cancel();
+      }
+    });
   }
 
-  /// Текущая GPS-позиция или null, если ещё не определена.
   Point? _currentPosition() => _userLocationLayer?.cameraPosition()?.target;
+
+  void _moveTo(Point p, {double zoom = 16}) {
+    _mapWindow?.map.move(
+      CameraPosition(p, zoom: zoom, azimuth: 0, tilt: 0),
+      animation: Animation(type: AnimationType.Smooth, duration: 0.6),
+    );
+  }
 
   void _goToMyLocation() {
     final pos = _currentPosition();
@@ -104,10 +171,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       _toast('Местоположение пока не определено. Подождите несколько секунд.');
       return;
     }
-    _mapWindow?.map.move(
-      CameraPosition(pos, zoom: 16, azimuth: 0, tilt: 0),
-      animation: Animation(type: AnimationType.Smooth, duration: 0.6),
-    );
+    _moveTo(pos);
   }
 
   // ---------------------------------------------------------------- Карта
@@ -125,17 +189,122 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _enableUserLocation();
   }
 
-  void _onMapTap(Point point) {
+  void _toggleTraffic(bool value) {
+    setState(() => _trafficOn = value);
+    _trafficLayer?.setTrafficVisible(value);
+    _toast(value
+        ? 'Пробки включены (видны в городах при масштабе города)'
+        : 'Пробки выключены');
+  }
+
+  // ---------------------------------------------------------------- Адреса
+
+  /// Поиск адреса по тексту.
+  void _search(String text) {
+    final window = _mapWindow;
+    if (window == null || text.trim().isEmpty) return;
+    FocusScope.of(context).unfocus();
     setState(() {
-      if (_pick == PickTarget.from) {
+      _searching = true;
+      _results = [];
+    });
+    _searchSession?.cancel();
+    _searchSession = _searchManager.submit(
+      VisibleRegionUtils.toPolygon(window.map.visibleRegion),
+      SearchOptions(searchTypes: SearchType.Geo, resultPageSize: 8),
+      SearchSessionSearchListener(
+        onSearchResponse: (response) {
+          if (!mounted) return;
+          final places = <_Place>[];
+          final objects = response.collection.children
+              .map((c) => c.asGeoObject())
+              .whereType<GeoObject>();
+          for (final o in objects) {
+            final pt = o.geometry.isNotEmpty ? o.geometry.first.asPoint() : null;
+            if (pt == null) continue;
+            places.add(_Place(
+              o.name ?? o.descriptionText ?? 'Без названия',
+              o.descriptionText,
+              pt,
+            ));
+          }
+          setState(() {
+            _searching = false;
+            _results = places;
+          });
+          if (places.isEmpty) _toast('Ничего не найдено. Уточните адрес.');
+        },
+        onSearchError: (e) {
+          if (!mounted) return;
+          setState(() => _searching = false);
+          _toast('Ошибка поиска: $e');
+        },
+      ),
+      text: text,
+    );
+  }
+
+  /// Определяет адрес по координатам (для нажатия на карту).
+  void _reverseGeocode(Point p, PickTarget target) {
+    _reverseSession?.cancel();
+    _reverseSession = _searchManager.submitPoint(
+      p,
+      SearchOptions(searchTypes: SearchType.Geo, resultPageSize: 1),
+      SearchSessionSearchListener(
+        onSearchResponse: (response) {
+          if (!mounted) return;
+          final objects = response.collection.children
+              .map((c) => c.asGeoObject())
+              .whereType<GeoObject>();
+          if (objects.isEmpty) return;
+          final o = objects.first;
+          final name = o.name ?? o.descriptionText;
+          if (name == null) return;
+          // Подписываем только если точка не успела смениться.
+          final current = target == PickTarget.from ? _from : _to;
+          if (current != p) return;
+          (target == PickTarget.from ? _fromCtl : _toCtl).text = name;
+        },
+        onSearchError: (_) {},
+      ),
+      zoom: 17,
+    );
+  }
+
+  void _choosePlace(_Place place) {
+    final target = _pick;
+    setState(() {
+      if (target == PickTarget.from) {
+        _from = place.point;
+        _fromIsMyLocation = false;
+        _fromCtl.text = place.name;
+        _pick = PickTarget.to;
+      } else {
+        _to = place.point;
+        _toCtl.text = place.name;
+      }
+      _results = [];
+    });
+    _moveTo(place.point, zoom: 15);
+    _redrawMarkers();
+  }
+
+  void _onMapTap(Point point) {
+    final target = _pick;
+    setState(() {
+      _results = [];
+      if (target == PickTarget.from) {
         _from = point;
         _fromIsMyLocation = false;
-        _pick = PickTarget.to; // после «откуда» сразу выбираем «куда»
+        _fromCtl.text = 'Определяю адрес…';
+        _pick = PickTarget.to;
       } else {
         _to = point;
+        _toCtl.text = 'Определяю адрес…';
       }
     });
     _redrawMarkers();
+    _reverseGeocode(point, target);
   }
 
   void _useMyLocationAsFrom() {
@@ -147,47 +316,53 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     setState(() {
       _from = pos;
       _fromIsMyLocation = true;
+      _fromCtl.text = 'Моё местоположение';
       _pick = PickTarget.to;
+      _results = [];
     });
+    FocusScope.of(context).unfocus();
     _redrawMarkers();
-  }
-
-  void _toggleTraffic(bool value) {
-    setState(() => _trafficOn = value);
-    _trafficLayer?.setTrafficVisible(value);
   }
 
   // ---------------------------------------------------------------- Объекты на карте
 
+  void _dot(Point p, Color fill, {double radius = 25}) {
+    final c = _mapWindow!.map.mapObjects.addCircle(Circle(p, radius: radius));
+    c.fillColor = fill;
+    c.strokeColor = Colors.white;
+    c.strokeWidth = 3;
+  }
+
   void _redrawMarkers() {
     final window = _mapWindow;
     if (window == null) return;
-    final objects = window.map.mapObjects;
-    objects.clear();
-
-    void dot(Point p, Color color) {
-      final c = objects.addCircle(Circle(p, radius: 25));
-      c.fillColor = color;
-      c.strokeColor = Colors.white;
-      c.strokeWidth = 3;
-    }
-
-    if (_from != null) dot(_from!, Colors.green);
-    if (_to != null) dot(_to!, Colors.red);
+    window.map.mapObjects.clear();
+    if (_from != null) _dot(_from!, Colors.green);
+    if (_to != null) _dot(_to!, Colors.red);
   }
 
-  void _drawPolyline(Polyline geometry, {required Color color, double width = 6}) {
+  void _drawPolyline(
+    Polyline geometry, {
+    required Color color,
+    double width = 6,
+    bool dashed = false,
+  }) {
     final window = _mapWindow;
     if (window == null) return;
     final line = window.map.mapObjects.addPolylineWithGeometry(geometry);
+    line.style = LineStyle(
+      strokeWidth: width,
+      dashLength: dashed ? 8 : 0,
+      gapLength: dashed ? 7 : 0,
+    );
     line.setStrokeColor(color);
-    line.strokeWidth = width;
   }
 
   void _showWholeRoute(Polyline geometry) {
     final window = _mapWindow;
     if (window == null) return;
-    final pos = window.map.cameraPositionForGeometry(Geometry.fromPolyline(geometry));
+    final pos =
+        window.map.cameraPositionForGeometry(Geometry.fromPolyline(geometry));
     window.map.move(
       pos,
       animation: Animation(type: AnimationType.Smooth, duration: 0.8),
@@ -197,13 +372,14 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   // ---------------------------------------------------------------- Маршруты
 
   void _buildRoute() {
+    FocusScope.of(context).unfocus();
     if (_fromIsMyLocation) {
-      // обновим стартовую точку по свежему GPS
       final pos = _currentPosition();
       if (pos != null) _from = pos;
     }
     if (_from == null || _to == null) {
-      _toast('Укажите, откуда и куда едете.');
+      _toast('Укажите, откуда и куда: введите адрес и выберите из списка, '
+          'либо нажмите на карту.');
       return;
     }
     _drivingSession?.cancel();
@@ -211,7 +387,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _redrawMarkers();
     setState(() {
       _loading = true;
-      _info = null;
+      _summary = null;
+      _steps = [];
+      _results = [];
     });
 
     final points = [
@@ -219,10 +397,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       RequestPoint(_to!, RequestPointType.Waypoint, null, null, null),
     ];
 
-    if (_mode == TravelMode.car) {
-      _requestCarRoutes(points);
-    } else {
-      _requestTransitRoutes(points);
+    switch (_mode) {
+      case TravelMode.car:
+        _requestCarRoutes(points);
+      case TravelMode.transit:
+        _requestTransitRoutes(points);
+      case TravelMode.walk:
+        _requestWalkRoutes(points);
     }
   }
 
@@ -237,7 +418,6 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             _fail('Маршрут не найден.');
             return;
           }
-          // Сначала запасные (серые), поверх — основной.
           for (var i = routes.length - 1; i >= 1; i--) {
             _drawPolyline(routes[i].geometry, color: Colors.grey, width: 5);
           }
@@ -247,7 +427,16 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           final w = routes[0].metadata.weight;
           setState(() {
             _loading = false;
-            _info = 'На авто: ${w.timeWithTraffic.text}, ${w.distance.text}';
+            _summary = 'На авто: ${w.timeWithTraffic.text}, ${w.distance.text}';
+            _steps = [
+              _Step(
+                Icons.directions_car,
+                Colors.blue,
+                'Время в пути с учётом пробок: ${w.timeWithTraffic.text}',
+                'Расстояние: ${w.distance.text}. '
+                    'Серым показаны запасные маршруты.',
+              ),
+            ];
           });
         },
         onDrivingRoutesError: (e) => _fail('Не удалось построить маршрут: $e'),
@@ -258,7 +447,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   void _requestTransitRoutes(List<RequestPoint> points) {
     _transitSession = _masstransitRouter.requestRoutes(
-      TransitOptions(TimeOptions()), // без привязки ко времени = «выехать сейчас»
+      TransitOptions(TimeOptions()),
       const RouteOptions(FitnessOptions()),
       RouteHandler(
         onMasstransitRoutes: (routes) {
@@ -270,15 +459,42 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           for (var i = routes.length - 1; i >= 1; i--) {
             _drawPolyline(routes[i].geometry, color: Colors.grey, width: 5);
           }
-          _drawPolyline(routes[0].geometry, color: Colors.deepPurple, width: 7);
+          _drawTransitRoute(routes[0]);
+          _showWholeRoute(routes[0].geometry);
+        },
+        onMasstransitRoutesError: (e) =>
+            _fail('Не удалось построить маршрут: $e'),
+      ),
+      points: points,
+    );
+  }
+
+  void _requestWalkRoutes(List<RequestPoint> points) {
+    _transitSession = _pedestrianRouter.requestRoutes(
+      TimeOptions(),
+      const RouteOptions(FitnessOptions()),
+      RouteHandler(
+        onMasstransitRoutes: (routes) {
+          if (!mounted) return;
+          if (routes.isEmpty) {
+            _fail('Пешеходный маршрут не найден.');
+            return;
+          }
+          for (var i = routes.length - 1; i >= 1; i--) {
+            _drawPolyline(routes[i].geometry, color: Colors.grey, width: 5);
+          }
+          _drawPolyline(routes[0].geometry,
+              color: Colors.green.shade700, width: 6, dashed: true);
           _showWholeRoute(routes[0].geometry);
 
           final w = routes[0].metadata.weight;
           setState(() {
             _loading = false;
-            _info = 'Транспорт: ${w.time.text}, '
-                'пешком ${w.walkingDistance.text}, '
-                'пересадок: ${w.transfersCount}';
+            _summary = 'Пешком: ${w.time.text}, ${w.walkingDistance.text}';
+            _steps = [
+              _Step(Icons.directions_walk, Colors.green.shade700,
+                  'Пешком ${w.walkingDistance.text}', 'Время: ${w.time.text}'),
+            ];
           });
         },
         onMasstransitRoutesError: (e) =>
@@ -288,11 +504,117 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 
+  /// Рисует маршрут по участкам: пешком — пунктиром, транспорт — цветом линии.
+  void _drawTransitRoute(MasstransitRoute route) {
+    final steps = <_Step>[];
+
+    for (final section in route.sections) {
+      final part =
+          SubpolylineHelper.subpolyline(route.geometry, section.geometry);
+      final weight = section.metadata.weight;
+      final transports = section.metadata.data.asVectorMasstransitTransport();
+
+      if (transports != null && transports.isNotEmpty) {
+        // ---- участок на транспорте
+        final line = transports.first.line;
+        final color = _lineColor(line);
+        _drawPolyline(part, color: color, width: 8);
+
+        final kind = _vehicleName(line.vehicleTypes);
+        final stops = section.stops;
+        String? subtitle;
+        if (stops.length >= 2) {
+          subtitle = 'Сядьте на остановке «${stops.first.metadata.stop.name}», '
+              'выйдите на «${stops.last.metadata.stop.name}» '
+              '(${weight.time.text}, остановок: ${stops.length - 1})';
+          _dot(stops.first.position, color, radius: 14);
+          _dot(stops.last.position, color, radius: 14);
+        }
+        // Если подходит несколько линий, перечисляем все номера.
+        final names = transports.map((t) => t.line.name).toSet().join(', ');
+        steps.add(_Step(
+          _vehicleIcon(line.vehicleTypes),
+          color,
+          '$kind $names',
+          subtitle,
+        ));
+      } else {
+        // ---- пеший участок / переход
+        _drawPolyline(part, color: Colors.blueGrey, width: 6, dashed: true);
+
+        final isWalk = section.metadata.data.asFitness() != null ||
+            section.metadata.data.asTransfer() != null;
+        if (isWalk) {
+          steps.add(_Step(
+            Icons.directions_walk,
+            Colors.blueGrey,
+            'Пешком ${weight.walkingDistance.text}',
+            weight.time.text,
+          ));
+        }
+      }
+    }
+
+    final w = route.metadata.weight;
+    setState(() {
+      _loading = false;
+      _summary = 'Транспорт: ${w.time.text}, '
+          'пешком ${w.walkingDistance.text}, пересадок: ${w.transfersCount}';
+      _steps = steps;
+    });
+  }
+
+  Color _lineColor(MasstransitLine line) {
+    final c = line.style?.color;
+    if (c != null) return Color(0xFF000000 | c);
+    final types = line.vehicleTypes.join(' ');
+    if (types.contains('tramway')) return Colors.red;
+    if (types.contains('trolleybus')) return Colors.blue;
+    if (types.contains('underground')) return Colors.purple;
+    if (types.contains('suburban') || types.contains('railway')) {
+      return Colors.teal;
+    }
+    if (types.contains('minibus')) return Colors.orange;
+    return Colors.green.shade700; // автобус и прочее
+  }
+
+  String _vehicleName(List<String> types) {
+    const names = {
+      'bus': 'Автобус',
+      'trolleybus': 'Троллейбус',
+      'tramway': 'Трамвай',
+      'underground': 'Метро',
+      'suburban': 'Электричка',
+      'railway': 'Поезд',
+      'minibus': 'Маршрутка',
+      'ferry': 'Паром',
+      'water': 'Водный транспорт',
+      'cable': 'Канатная дорога',
+      'funicular': 'Фуникулёр',
+      'aeroexpress': 'Аэроэкспресс',
+    };
+    for (final t in types) {
+      final n = names[t];
+      if (n != null) return n;
+    }
+    return 'Транспорт';
+  }
+
+  IconData _vehicleIcon(List<String> types) {
+    final s = types.join(' ');
+    if (s.contains('tramway')) return Icons.tram;
+    if (s.contains('underground')) return Icons.subway;
+    if (s.contains('suburban') || s.contains('railway')) return Icons.train;
+    if (s.contains('ferry') || s.contains('water')) return Icons.directions_boat;
+    return Icons.directions_bus;
+  }
+
   void _fail(String message) {
     if (!mounted) return;
     setState(() {
       _loading = false;
-      _info = null;
+      _summary = null;
+      _steps = [];
     });
     _toast(message);
   }
@@ -300,14 +622,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   void _clearAll() {
     _drivingSession?.cancel();
     _transitSession?.cancel();
+    _searchSession?.cancel();
     _mapWindow?.map.mapObjects.clear();
+    _fromCtl.clear();
+    _toCtl.clear();
     setState(() {
       _from = null;
       _to = null;
       _fromIsMyLocation = false;
       _pick = PickTarget.from;
-      _info = null;
+      _summary = null;
+      _steps = [];
+      _results = [];
       _loading = false;
+      _searching = false;
     });
   }
 
@@ -323,39 +651,193 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
           YandexMap(onMapCreated: _onMapCreated),
           SafeArea(child: _buildTopPanel()),
-          Positioned(
-            right: 12,
-            bottom: 24 + (_info != null ? 70 : 0),
-            child: Column(
-              children: [
-                FloatingActionButton.small(
-                  heroTag: 'traffic',
-                  backgroundColor: _trafficOn ? Colors.orange : null,
-                  onPressed: () => _toggleTraffic(!_trafficOn),
-                  child: const Icon(Icons.traffic),
-                ),
-                const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  heroTag: 'gps',
-                  onPressed: _goToMyLocation,
-                  child: const Icon(Icons.my_location),
-                ),
-              ],
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 12, bottom: 8),
+                    child: Column(
+                      children: [
+                        FloatingActionButton.small(
+                          heroTag: 'traffic',
+                          backgroundColor: _trafficOn ? Colors.orange : null,
+                          onPressed: () => _toggleTraffic(!_trafficOn),
+                          child: const Icon(Icons.traffic),
+                        ),
+                        const SizedBox(height: 8),
+                        FloatingActionButton.small(
+                          heroTag: 'gps',
+                          onPressed: _goToMyLocation,
+                          child: const Icon(Icons.my_location),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (_summary != null) _buildInfoCard(),
+                ],
+              ),
             ),
           ),
-          if (_info != null)
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: 16,
-              child: Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Text(_info!, style: Theme.of(context).textTheme.titleMedium),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInfoCard() {
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 260),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
+              child: Text(_summary!,
+                  style: Theme.of(context).textTheme.titleMedium),
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: EdgeInsets.zero,
+                itemCount: _steps.length,
+                itemBuilder: (_, i) {
+                  final s = _steps[i];
+                  return ListTile(
+                    dense: true,
+                    leading: CircleAvatar(
+                      radius: 16,
+                      backgroundColor: s.color,
+                      child: Icon(s.icon, size: 18, color: Colors.white),
+                    ),
+                    title: Text(s.title,
+                        style: const TextStyle(fontWeight: FontWeight.w600)),
+                    subtitle: s.subtitle == null ? null : Text(s.subtitle!),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopPanel() {
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SegmentedButton<TravelMode>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(
+                        value: TravelMode.car,
+                        icon: Icon(Icons.directions_car),
+                        label: Text('Авто'),
+                      ),
+                      ButtonSegment(
+                        value: TravelMode.transit,
+                        icon: Icon(Icons.directions_bus),
+                        label: Text('Транспорт'),
+                      ),
+                      ButtonSegment(
+                        value: TravelMode.walk,
+                        icon: Icon(Icons.directions_walk),
+                        label: Text('Пешком'),
+                      ),
+                    ],
+                    selected: {_mode},
+                    onSelectionChanged: (s) => setState(() => _mode = s.first),
+                  ),
+                  const SizedBox(height: 8),
+                  _field(
+                    controller: _fromCtl,
+                    focus: _fromFocus,
+                    label: 'Откуда',
+                    icon: Icons.trip_origin,
+                    color: Colors.green,
+                    extra: IconButton(
+                      tooltip: 'Я здесь (GPS)',
+                      icon: const Icon(Icons.gps_fixed),
+                      onPressed: _useMyLocationAsFrom,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  _field(
+                    controller: _toCtl,
+                    focus: _toFocus,
+                    label: 'Куда',
+                    icon: Icons.place,
+                    color: Colors.red,
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _loading ? null : _buildRoute,
+                          icon: _loading
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child:
+                                      CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Icon(Icons.alt_route),
+                          label: const Text('Построить маршрут'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      OutlinedButton(
+                        onPressed: _clearAll,
+                        child: const Text('Сброс'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_searching) const LinearProgressIndicator(),
+          if (_results.isNotEmpty)
+            Card(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 220),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  padding: EdgeInsets.zero,
+                  itemCount: _results.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (_, i) {
+                    final p = _results[i];
+                    return ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.place_outlined),
+                      title: Text(p.name),
+                      subtitle:
+                          p.description == null ? null : Text(p.description!),
+                      onTap: () => _choosePlace(p),
+                    );
+                  },
                 ),
               ),
             ),
@@ -364,123 +846,39 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildTopPanel() {
-    return Padding(
-      padding: const EdgeInsets.all(8),
-      child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SegmentedButton<TravelMode>(
-                segments: const [
-                  ButtonSegment(
-                    value: TravelMode.car,
-                    icon: Icon(Icons.directions_car),
-                    label: Text('Авто'),
-                  ),
-                  ButtonSegment(
-                    value: TravelMode.transit,
-                    icon: Icon(Icons.directions_bus),
-                    label: Text('Транспорт'),
-                  ),
-                ],
-                selected: {_mode},
-                onSelectionChanged: (s) => setState(() => _mode = s.first),
-              ),
-              const SizedBox(height: 8),
-              _pointRow(
-                icon: Icons.trip_origin,
-                color: Colors.green,
-                label: 'Откуда',
-                text: _fromIsMyLocation
-                    ? 'Моё местоположение'
-                    : _from == null
-                        ? 'Нажмите на карту'
-                        : _fmt(_from!),
-                selected: _pick == PickTarget.from,
-                onTap: () => setState(() => _pick = PickTarget.from),
-                trailing: IconButton(
-                  tooltip: 'Я здесь (GPS)',
-                  icon: const Icon(Icons.gps_fixed),
-                  onPressed: _useMyLocationAsFrom,
-                ),
-              ),
-              _pointRow(
-                icon: Icons.place,
-                color: Colors.red,
-                label: 'Куда',
-                text: _to == null ? 'Нажмите на карту' : _fmt(_to!),
-                selected: _pick == PickTarget.to,
-                onTap: () => setState(() => _pick = PickTarget.to),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _loading ? null : _buildRoute,
-                      icon: _loading
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.alt_route),
-                      label: const Text('Построить маршрут'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed: _clearAll,
-                    child: const Text('Сброс'),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _pointRow({
+  Widget _field({
+    required TextEditingController controller,
+    required FocusNode focus,
+    required String label,
     required IconData icon,
     required Color color,
-    required String label,
-    required String text,
-    required bool selected,
-    required VoidCallback onTap,
-    Widget? trailing,
+    Widget? extra,
   }) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: selected ? color : Colors.transparent,
-            width: 2,
-          ),
-        ),
-        child: Row(
+    return TextField(
+      controller: controller,
+      focusNode: focus,
+      textInputAction: TextInputAction.search,
+      onSubmitted: _search,
+      decoration: InputDecoration(
+        isDense: true,
+        labelText: label,
+        hintText: 'Введите адрес или нажмите на карту',
+        prefixIcon: Icon(icon, color: color),
+        border: const OutlineInputBorder(),
+        suffixIcon: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, color: color),
-            const SizedBox(width: 8),
-            Text('$label: ', style: const TextStyle(fontWeight: FontWeight.bold)),
-            Expanded(child: Text(text, overflow: TextOverflow.ellipsis)),
-            if (trailing != null) trailing,
+            if (extra != null) extra,
+            IconButton(
+              tooltip: 'Найти',
+              icon: const Icon(Icons.search),
+              onPressed: () => _search(controller.text),
+            ),
           ],
         ),
       ),
     );
   }
-
-  String _fmt(Point p) =>
-      '${p.latitude.toStringAsFixed(5)}, ${p.longitude.toStringAsFixed(5)}';
 }
 
 // -------------------------------------------------------------------- слушатели
